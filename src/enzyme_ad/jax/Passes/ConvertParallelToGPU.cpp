@@ -252,7 +252,10 @@ getDirectlyNestedSingleParallel_(const char *PATTERN, Block *block,
 // refer to how the KernelAttrName is done for gpu, nvvm, rocdl - needs upstream
 // mlir patch) and
 struct AddLaunchBounds : public OpRewritePattern<gpu::LaunchFuncOp> {
-  using OpRewritePattern<gpu::LaunchFuncOp>::OpRewritePattern;
+  AddLaunchBounds(MLIRContext *ctx, int minCtasTarget = 0)
+      : OpRewritePattern<gpu::LaunchFuncOp>(ctx), minCtasTarget(minCtasTarget) {
+  }
+  int minCtasTarget;
   LogicalResult matchAndRewrite(gpu::LaunchFuncOp launchOp,
                                 PatternRewriter &rewriter) const override {
     // TODO Currently this can be done safely because the enzymexla pipeline
@@ -287,7 +290,47 @@ struct AddLaunchBounds : public OpRewritePattern<gpu::LaunchFuncOp> {
     int blockSize = *bx * *by * *bz;
     // A kernel with a known block size already gets its bound from that
     // attribute during lowering; adding it here would duplicate it.
-    if (gpuFuncOp->hasAttr("known_block_size"))
+    bool knownBlockSize = gpuFuncOp->hasAttr("known_block_size");
+    // ptxas budgets registers for the resident-block count it assumes; a
+    // kernel that could fit more blocks but is given none of this
+    // information is compiled for fewer, larger blocks and loses occupancy.
+    // Ask for a resident count, bounded by what the block size and the
+    // kernel's static shared memory keep satisfiable.
+    if (minCtasTarget > 0 && !gpuFuncOp->hasAttr("nvvm.minctasm")) {
+      int64_t smem = 0;
+      if (auto gf = dyn_cast<gpu::GPUFuncOp>(gpuFuncOp)) {
+        for (auto attribution : gf.getWorkgroupAttributionBBArgs())
+          if (auto mt = dyn_cast<MemRefType>(attribution.getType()))
+            if (mt.hasStaticShape())
+              smem += mt.getNumElements() *
+                      llvm::divideCeil(mt.getElementTypeBitWidth(), 8);
+        auto mod = gf->getParentOfType<gpu::GPUModuleOp>();
+        gf.walk([&](memref::GetGlobalOp gg) {
+          auto glob = mod.lookupSymbol<memref::GlobalOp>(gg.getName());
+          if (!glob)
+            return;
+          auto mt = glob.getType();
+          auto space = mt.getMemorySpace();
+          bool wg = false;
+          if (auto ia = dyn_cast_or_null<IntegerAttr>(space))
+            wg = ia.getInt() == 3;
+          else if (auto ga = dyn_cast_or_null<gpu::AddressSpaceAttr>(space))
+            wg = ga.getValue() == gpu::AddressSpace::Workgroup;
+          if (wg && mt.hasStaticShape())
+            smem += mt.getNumElements() *
+                    llvm::divideCeil(mt.getElementTypeBitWidth(), 8);
+        });
+      }
+      int64_t byThreads = std::max<int64_t>(1, 1024 / blockSize);
+      int64_t bySmem =
+          smem ? std::max<int64_t>(1, (96 * 1024) / smem) : minCtasTarget;
+      int64_t ctas = std::min<int64_t>({minCtasTarget, byThreads, bySmem});
+      if (ctas > 1)
+        gpuFuncOp->setAttr(
+            "nvvm.minctasm",
+            rewriter.getIntegerAttr(rewriter.getI32Type(), (int32_t)ctas));
+    }
+    if (knownBlockSize)
       return failure();
     llvm::StringRef attrName = "nvvm.maxntid";
     auto ntid = rewriter.getDenseI32ArrayAttr(
@@ -2819,7 +2862,7 @@ gdgo->erase();
 
     RewritePatternSet patterns(&getContext());
     if (emitGPUKernelLaunchBounds)
-      patterns.insert<AddLaunchBounds>(&getContext());
+      patterns.insert<AddLaunchBounds>(&getContext(), minCtasTarget);
     patterns
         .insert<SharedLLVMAllocaToGlobal, SharedMemrefAllocaToGlobal,
                 RemoveFunction<func::FuncOp>, RemoveFunction<LLVM::LLVMFuncOp>>(

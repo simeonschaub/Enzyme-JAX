@@ -1025,6 +1025,14 @@ def ConvertParallelToGPU2 : Pass<"convert-parallel-to-gpu2"> {
        /*default=*/"false",
        /*description=*/"Convert Periodic Concat to Manual Computation with CollectivePermute">,
     Option<
+       /*C++ variable name=*/"minCtasTarget",
+       /*CLI argument=*/"minCtasTarget",
+       /*type=*/"int",
+       /*default=*/"0",
+       /*description=*/"Target resident-block count for kernels with a "
+                       "static block size, bounded by what the block size "
+                       "and static shared memory allow; 0 disables">,
+    Option<
        /*C++ variable name=*/"backend",
        /*CLI argument=*/"backend",
        /*type=*/"std::string",
